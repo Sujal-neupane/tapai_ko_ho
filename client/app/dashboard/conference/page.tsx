@@ -108,16 +108,22 @@ export default function ConferencePage() {
           const data = JSON.parse(evt.data);
           
           if (data.type === "offer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-            hasRemoteDescRef.current = true;
-            await processPendingCandidates(pc);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({ type: "answer", answer, meetingId }));
+            // Only process offer if we're in stable state
+            if (pc.signalingState === "stable") {
+              await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+              hasRemoteDescRef.current = true;
+              await processPendingCandidates(pc);
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: "answer", answer, meetingId }));
+            }
           } else if (data.type === "answer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            hasRemoteDescRef.current = true;
-            await processPendingCandidates(pc);
+            // Only set answer if we're expecting one (have-local-offer state)
+            if (pc.signalingState === "have-local-offer") {
+              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+              hasRemoteDescRef.current = true;
+              await processPendingCandidates(pc);
+            }
           } else if (data.type === "ice-candidate") {
             const candidate = new RTCIceCandidate(data.candidate);
             if (hasRemoteDescRef.current && pc.remoteDescription) {
@@ -130,12 +136,18 @@ export default function ConferencePage() {
               pendingCandidatesRef.current.push(candidate);
             }
           } else if (data.type === "peer-joined") {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify({ type: "offer", offer, meetingId }));
+            // Only create offer if we're in stable state
+            if (pc.signalingState === "stable") {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              ws.send(JSON.stringify({ type: "offer", offer, meetingId }));
+            }
           } else if (data.type === "peer-left") {
             setHasRemote(false);
             setParticipants(1);
+            // Reset peer connection state
+            hasRemoteDescRef.current = false;
+            pendingCandidatesRef.current = [];
           }
         };
 
