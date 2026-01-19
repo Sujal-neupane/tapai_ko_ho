@@ -21,13 +21,10 @@ export default function Dashboard() {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (videoRef.current) videoRef.current.srcObject = stream;
 
-        // Backend host - CHANGE THIS IP if you're a teammate!
-        // Host (running backend): use 'localhost'
-        // Teammates: use host's IP like '172.20.10.13'
-        const isLocalhost = typeof window !== 'undefined' && 
-                           (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
-        const backendHost = isLocalhost ? 'localhost' : '172.20.10.13';
-        ws = new WebSocket(`ws://${backendHost}:8000/ws`);
+        // Backend WebSocket - HARDCODED IP for hackathon
+        // Change '172.20.10.13' to host's IP if network changes
+        const BACKEND_IP = '172.20.10.13';
+        ws = new WebSocket(`ws://${BACKEND_IP}:8000/ws`);
         ws.onopen = () => setConnected(true);
         ws.onclose = () => setConnected(false);
         ws.onmessage = (e) => setResult(JSON.parse(e.data));

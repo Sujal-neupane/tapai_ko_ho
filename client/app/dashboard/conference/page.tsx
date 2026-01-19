@@ -92,13 +92,10 @@ export default function ConferencePage() {
           }
         };
 
-        // Backend host - CHANGE THIS IP if you're a teammate!
-        // Host (running backend): use 'localhost'
-        // Teammates: use host's IP like '172.20.10.13'
-        const isLocalhost = typeof window !== 'undefined' && 
-                           (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
-        const backendHost = isLocalhost ? 'localhost' : '172.20.10.13';
-        const wsUrl = `ws://${backendHost}:8000/conference`;
+        // Backend WebSocket - HARDCODED IP for hackathon
+        // Change '172.20.10.13' to host's IP if network changes
+        const BACKEND_IP = '172.20.10.13';
+        const wsUrl = `ws://${BACKEND_IP}:8000/conference`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
