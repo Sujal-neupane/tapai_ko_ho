@@ -92,9 +92,13 @@ export default function ConferencePage() {
           }
         };
 
-        // Dynamic WebSocket URL - works for localhost and network access
-        const wsHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-        const wsUrl = `ws://${wsHost}:8000/conference`;
+        // Backend host - CHANGE THIS IP if you're a teammate!
+        // Host (running backend): use 'localhost'
+        // Teammates: use host's IP like '172.20.10.13'
+        const isLocalhost = typeof window !== 'undefined' && 
+                           (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+        const backendHost = isLocalhost ? 'localhost' : '172.20.10.13';
+        const wsUrl = `ws://${backendHost}:8000/conference`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
