@@ -1,6 +1,6 @@
 @echo off
 echo ==========================================
-echo   Cyber Guardian - Team Setup
+echo   Team Ballers - Team Setup
 echo ==========================================
 echo.
 

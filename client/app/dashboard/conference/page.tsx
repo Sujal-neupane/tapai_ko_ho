@@ -56,7 +56,27 @@ export default function ConferencePage() {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-      ]
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
+        // Free TURN servers for NAT traversal
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject"
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject"
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443?transport=tcp",
+          username: "openrelayproject",
+          credential: "openrelayproject"
+        }
+      ],
+      iceCandidatePoolSize: 10
     });
     pcRef.current = pc;
 
@@ -130,7 +150,7 @@ export default function ConferencePage() {
         ws.onmessage = async (evt) => {
           const data = JSON.parse(evt.data);
           const pc = pcRef.current;
-          if (!pc) return;
+          if (!pc || pc.signalingState === "closed") return;
 
           try {
             if (data.type === "offer") {
@@ -153,11 +173,11 @@ export default function ConferencePage() {
               }
 
             } else if (data.type === "ice-candidate" && data.candidate) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-              } catch (e) {
-                if (!ignoreOfferRef.current) {
-                  console.warn("ICE error (can ignore):", e);
+              if (pc.signalingState !== "closed") {
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                } catch (e) {
+                  // Ignore ICE errors silently
                 }
               }
 
