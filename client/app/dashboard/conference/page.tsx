@@ -56,22 +56,30 @@ export default function ConferencePage() {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun.relay.metered.ca:80" },
         {
-          urls: "turn:openrelay.metered.ca:80",
-          username: "openrelayproject",
-          credential: "openrelayproject"
+          urls: "turn:global.relay.metered.ca:80",
+          username: "e8dd65b92c629e4e1048c809",
+          credential: "5UxxMNdpNIBJsrlq"
         },
         {
-          urls: "turn:openrelay.metered.ca:443",
-          username: "openrelayproject",
-          credential: "openrelayproject"
+          urls: "turn:global.relay.metered.ca:80?transport=tcp",
+          username: "e8dd65b92c629e4e1048c809",
+          credential: "5UxxMNdpNIBJsrlq"
         },
         {
-          urls: "turn:openrelay.metered.ca:443?transport=tcp",
-          username: "openrelayproject",
-          credential: "openrelayproject"
+          urls: "turn:global.relay.metered.ca:443",
+          username: "e8dd65b92c629e4e1048c809",
+          credential: "5UxxMNdpNIBJsrlq"
+        },
+        {
+          urls: "turns:global.relay.metered.ca:443?transport=tcp",
+          username: "e8dd65b92c629e4e1048c809",
+          credential: "5UxxMNdpNIBJsrlq"
         }
-      ]
+      ],
+      iceCandidatePoolSize: 10
     });
 
     pcRef.current = pc;
@@ -103,6 +111,10 @@ export default function ConferencePage() {
 
     pc.oniceconnectionstatechange = () => {
       console.log("ICE:", pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed") {
+        console.log("ICE failed, restarting...");
+        pc.restartIce();
+      }
     };
 
     pc.onconnectionstatechange = () => {
@@ -110,6 +122,25 @@ export default function ConferencePage() {
       if (pc.connectionState === "connected") {
         setHasRemote(true);
         setParticipants(2);
+      } else if (pc.connectionState === "failed") {
+        // Try to restart the connection
+        console.log("Connection failed, attempting restart...");
+        if (isHostRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+          setTimeout(async () => {
+            try {
+              const offer = await pc.createOffer({ iceRestart: true });
+              await pc.setLocalDescription(offer);
+              wsRef.current?.send(JSON.stringify({
+                type: "offer",
+                offer: pc.localDescription,
+                meetingId
+              }));
+              console.log("Restart offer sent");
+            } catch (e) {
+              console.error("Restart failed:", e);
+            }
+          }, 1000);
+        }
       }
     };
 
@@ -198,14 +229,15 @@ export default function ConferencePage() {
             const pc = pcRef.current;
             if (!pc || !wsRef.current) return;
             
-            // Only guests should receive offers
-            if (isHostRef.current) {
-              console.log("Ignoring offer (I am host)");
-              return;
-            }
-            
-            console.log("Handling offer");
+            // Guests handle offers (including re-offers for ICE restart)
+            console.log("Handling offer, signaling state:", pc.signalingState);
             try {
+              // If we're in stable state or have-remote-offer, we can accept
+              if (pc.signalingState !== "stable" && pc.signalingState !== "have-remote-offer") {
+                console.log("Rolling back before accepting offer");
+                await pc.setLocalDescription({ type: "rollback" });
+              }
+              
               await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
               
               // Add any pending ICE candidates
