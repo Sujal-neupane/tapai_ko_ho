@@ -92,7 +92,10 @@ export default function ConferencePage() {
           }
         };
 
-        const ws = new WebSocket("ws://localhost:8000/conference");
+        // Dynamic WebSocket URL - works for localhost and network access
+        const wsHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+        const wsUrl = `ws://${wsHost}:8000/conference`;
+        const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
