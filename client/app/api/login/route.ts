@@ -3,11 +3,11 @@ import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/prisma";
 import { loginSchema } from "@/lib/validators";
 import { signAuthToken, setAuthCookie } from "@/lib/auth";
-import { redis } from "@/lib/redis";
 
-const FAIL_KEY_PREFIX = "login:fail:";
+// Simple in-memory rate limiting (resets on server restart - fine for hackathon)
+const failedAttempts = new Map<string, { count: number; lockedUntil: number }>();
 const LOCK_THRESHOLD = 5;
-const LOCK_TTL_SECONDS = 15 * 60;
+const LOCK_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
 export async function POST(req: Request) {
   try {
@@ -18,29 +18,31 @@ export async function POST(req: Request) {
     }
     const { email, password } = parsed.data;
 
-    const failKey = `${FAIL_KEY_PREFIX}${email}`;
-    const failCount = Number((await redis.get(failKey)) || 0);
-    const ttl = await redis.ttl(failKey);
-    if (failCount >= LOCK_THRESHOLD && ttl > 0) {
+    // Check if account is locked
+    const attempt = failedAttempts.get(email);
+    if (attempt && attempt.count >= LOCK_THRESHOLD && Date.now() < attempt.lockedUntil) {
+      const minutesLeft = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
       return NextResponse.json(
-        { message: "Account locked for 15 minutes due to failed logins" },
+        { message: `Account locked. Try again in ${minutesLeft} minutes` },
         { status: 429 }
       );
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      await handleFailure(failKey);
+      handleFailure(email);
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 });
     }
 
     const valid = await bcrypt.compare(password, user.hashedPassword);
     if (!valid) {
-      await handleFailure(failKey);
+      handleFailure(email);
       return NextResponse.json({ message: "Invalid credentials" }, { status: 401 });
     }
 
-    await redis.del(failKey);
+    // Success - clear failed attempts
+    failedAttempts.delete(email);
+    
     const token = signAuthToken(user.id, user.email);
     setAuthCookie(token);
     return NextResponse.json({ message: "Authenticated" });
@@ -50,9 +52,11 @@ export async function POST(req: Request) {
   }
 }
 
-async function handleFailure(failKey: string) {
-  const count = await redis.incr(failKey);
-  if (count === 1) {
-    await redis.expire(failKey, LOCK_TTL_SECONDS);
+function handleFailure(email: string) {
+  const attempt = failedAttempts.get(email) || { count: 0, lockedUntil: 0 };
+  attempt.count++;
+  if (attempt.count >= LOCK_THRESHOLD) {
+    attempt.lockedUntil = Date.now() + LOCK_DURATION_MS;
   }
+  failedAttempts.set(email, attempt);
 }

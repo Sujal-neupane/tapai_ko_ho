@@ -9,9 +9,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from redis.asyncio import Redis
+from pydantic import BaseModel
+
+# Import AI model (AI team will update this)
+from models.detector import detect_deepfake, detect_from_base64, DetectionResult
 
 app = FastAPI(title="Cyber Guardian AI Gateway")
 
@@ -23,30 +26,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-QUEUE_REDIS_URL = os.getenv("INFERENCE_QUEUE_URL") or os.getenv("REDIS_URL")
-QUEUE_KEY = "inference:jobs"
-RESULT_PREFIX = "inference:result:"
-QUEUE_TIMEOUT = float(os.getenv("INFERENCE_QUEUE_TIMEOUT", "1.0"))
 
-redis_client: Optional[Redis] = None
-if QUEUE_REDIS_URL:
-        redis_client = Redis.from_url(QUEUE_REDIS_URL, decode_responses=True)
+# ============================================
+# AI Detection Endpoint (AI Team works here!)
+# ============================================
+
+class FrameData(BaseModel):
+    frame: str  # base64 encoded image
 
 
-async def _analyze_via_queue(frame_b64: str, sent_at_ms: float) -> Optional[dict[str, Any]]:
-    if not redis_client:
-        return None
-    job_id = secrets.token_hex(8)
-    try:
-        await redis_client.lpush(QUEUE_KEY, json.dumps({"id": job_id, "frame": frame_b64, "sent_at": sent_at_ms}))
-        res = await redis_client.brpop(f"{RESULT_PREFIX}{job_id}", timeout=QUEUE_TIMEOUT)
-        if not res:
-            return None
-        _, data = res
-        return json.loads(data)
-    except Exception as exc:  # queue issues should not break websocket
-        print(f"queue error: {exc}")
-        return None
+@app.post("/api/detect")
+async def detect_frame(data: FrameData):
+    """
+    Detect deepfake from a base64 encoded image frame.
+    AI Team: The actual detection logic is in models/detector.py
+    """
+    result = detect_from_base64(data.frame)
+    return {
+        "is_fake": result.is_fake,
+        "confidence": result.confidence,
+        "message": result.message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.post("/api/detect/upload")
+async def detect_upload(file: UploadFile = File(...)):
+    """
+    Detect deepfake from uploaded image file.
+    """
+    contents = await file.read()
+    result = detect_deepfake(contents)
+    return {
+        "is_fake": result.is_fake,
+        "confidence": result.confidence,
+        "message": result.message,
+        "filename": file.filename,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# ============================================
+# Frame Analysis (Local fallback)
+# ============================================
 
 
 def _analyze_frame(frame_b64: str, sent_at_ms: float) -> dict[str, object]:
@@ -97,10 +125,8 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"is_fake": True, "confidence": 0.99, "alert_msg": "Bad payload"})
                 continue
 
-            # Prefer external inference queue; fall back to local heuristic.
-            result = await _analyze_via_queue(frame or "", sent_at)
-            if result is None:
-                result = _analyze_frame(frame or "", sent_at)
+            # Use AI model for detection
+            result = _analyze_frame(frame or "", sent_at)
             result["timestamp"] = datetime.now(timezone.utc).isoformat()
             await ws.send_json(result)
             await asyncio.sleep(0)
