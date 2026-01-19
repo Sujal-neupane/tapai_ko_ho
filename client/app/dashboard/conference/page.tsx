@@ -15,9 +15,8 @@ export default function ConferencePage() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const makingOfferRef = useRef(false);
-  const ignoreOfferRef = useRef(false);
-  const isPoliteRef = useRef(false);
+  const isPoliteRef = useRef(false); // true = we yield on collision, false = we win
+  const localStreamRef = useRef<MediaStream | null>(null);
 
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [connected, setConnected] = useState(false);
@@ -46,19 +45,18 @@ export default function ConferencePage() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // Create peer connection
-  const createPeerConnection = (stream: MediaStream, ws: WebSocket) => {
+  // Create a fresh peer connection
+  const createPeerConnection = () => {
+    // Close existing connection if any
     if (pcRef.current) {
       pcRef.current.close();
+      pcRef.current = null;
     }
 
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
         // Free TURN servers for NAT traversal
         {
           urls: "turn:openrelay.metered.ca:80",
@@ -78,11 +76,19 @@ export default function ConferencePage() {
       ],
       iceCandidatePoolSize: 10
     });
+
     pcRef.current = pc;
 
-    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+    // Add local tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current!);
+      });
+    }
 
+    // Handle incoming tracks
     pc.ontrack = (e) => {
+      console.log("Got remote track:", e.track.kind);
       if (remoteVideoRef.current && e.streams[0]) {
         remoteVideoRef.current.srcObject = e.streams[0];
         setHasRemote(true);
@@ -90,9 +96,10 @@ export default function ConferencePage() {
       }
     };
 
+    // Send ICE candidates
     pc.onicecandidate = (e) => {
-      if (e.candidate && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
+      if (e.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
           type: "ice-candidate",
           candidate: e.candidate,
           meetingId
@@ -100,135 +107,195 @@ export default function ConferencePage() {
       }
     };
 
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-        setHasRemote(false);
-        setParticipants(1);
+    pc.oniceconnectionstatechange = () => {
+      console.log("ICE state:", pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed") {
+        console.log("ICE failed, restarting...");
+        pc.restartIce();
       }
     };
 
-    pc.onnegotiationneeded = async () => {
-      try {
-        makingOfferRef.current = true;
-        await pc.setLocalDescription();
-        ws.send(JSON.stringify({
-          type: "offer",
-          offer: pc.localDescription,
-          meetingId
-        }));
-      } catch (err) {
-        console.error("Negotiation error:", err);
-      } finally {
-        makingOfferRef.current = false;
+    pc.onconnectionstatechange = () => {
+      console.log("Connection state:", pc.connectionState);
+      if (pc.connectionState === "connected") {
+        setHasRemote(true);
+      } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        setHasRemote(false);
+        setParticipants(1);
       }
     };
 
     return pc;
   };
 
+  // Send an offer (only called by impolite peer)
+  const sendOffer = async () => {
+    const pc = pcRef.current;
+    const ws = wsRef.current;
+    if (!pc || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      console.log("Creating offer...");
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({
+        type: "offer",
+        offer: pc.localDescription,
+        meetingId
+      }));
+      console.log("Offer sent");
+    } catch (err) {
+      console.error("Error sending offer:", err);
+    }
+  };
+
   useEffect(() => {
     let stream: MediaStream | null = null;
-    let ws: WebSocket | null = null;
 
     const init = async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        // Get camera/mic
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: true, 
+          video: { width: 640, height: 480 } 
+        });
+        localStreamRef.current = stream;
         setLocalStream(stream);
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
         }
 
-        ws = new WebSocket(`ws://${BACKEND_IP}:8000/conference`);
+        // Connect to signaling server
+        const ws = new WebSocket(`ws://${BACKEND_IP}:8000/conference`);
         wsRef.current = ws;
 
         ws.onopen = () => {
+          console.log("WebSocket connected");
           setConnected(true);
-          createPeerConnection(stream!, ws!);
-          ws!.send(JSON.stringify({ type: "join", meetingId }));
+          // Create peer connection (but don't send offer yet)
+          createPeerConnection();
+          // Join the room
+          ws.send(JSON.stringify({ type: "join", meetingId }));
         };
 
         ws.onmessage = async (evt) => {
           const data = JSON.parse(evt.data);
           const pc = pcRef.current;
-          if (!pc || pc.signalingState === "closed") return;
+          
+          console.log("Received:", data.type);
 
-          try {
-            if (data.type === "offer") {
-              const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
-              ignoreOfferRef.current = !isPoliteRef.current && offerCollision;
+          if (data.type === "joined") {
+            // Server confirms we joined
+            const existingPeers = data.existingPeers || [];
+            console.log("Joined room, existing peers:", existingPeers.length);
+            
+            if (existingPeers.length > 0) {
+              // We are the polite peer (new joiner)
+              isPoliteRef.current = true;
+              setParticipants(existingPeers.length + 1);
+              console.log("We are POLITE (new joiner)");
+            } else {
+              // We are the impolite peer (first in room)
+              isPoliteRef.current = false;
+              console.log("We are IMPOLITE (first in room)");
+            }
+          }
+
+          else if (data.type === "peer-joined") {
+            // A new peer joined - we are the existing peer (impolite)
+            console.log("New peer joined, we send offer");
+            setParticipants(p => p + 1);
+            
+            // Recreate peer connection to reset state
+            createPeerConnection();
+            
+            // Small delay then send offer
+            setTimeout(() => sendOffer(), 100);
+          }
+
+          else if (data.type === "offer") {
+            if (!pc) return;
+            console.log("Received offer, signalingState:", pc.signalingState);
+            
+            try {
+              // If we're not polite and we have a pending offer, ignore incoming
+              if (!isPoliteRef.current && pc.signalingState !== "stable") {
+                console.log("Ignoring offer (we are impolite and not stable)");
+                return;
+              }
               
-              if (ignoreOfferRef.current) return;
-
+              // If we need to rollback our own offer
+              if (pc.signalingState !== "stable") {
+                console.log("Rolling back local description");
+                await pc.setLocalDescription({ type: "rollback" });
+              }
+              
               await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-              await pc.setLocalDescription();
-              ws!.send(JSON.stringify({
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              
+              wsRef.current?.send(JSON.stringify({
                 type: "answer",
                 answer: pc.localDescription,
                 meetingId
               }));
+              console.log("Answer sent");
+            } catch (err) {
+              console.error("Error handling offer:", err);
+            }
+          }
 
-            } else if (data.type === "answer") {
+          else if (data.type === "answer") {
+            if (!pc) return;
+            console.log("Received answer, signalingState:", pc.signalingState);
+            
+            try {
               if (pc.signalingState === "have-local-offer") {
                 await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                console.log("Answer applied");
+              } else {
+                console.log("Ignoring answer, wrong state:", pc.signalingState);
               }
-
-            } else if (data.type === "ice-candidate" && data.candidate) {
-              if ((pc.signalingState as string) !== "closed") {
-                try {
-                  await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                } catch (e) {
-                  // Ignore ICE errors silently
-                }
-              }
-
-            } else if (data.type === "peer-joined") {
-              // We are the existing peer (impolite), new peer joined
-              // We need to send an offer to the new peer
-              setParticipants(p => p + 1);
-              
-              // Create and send offer to the new peer
-              const pc = pcRef.current;
-              if (pc && ws) {
-                try {
-                  makingOfferRef.current = true;
-                  const offer = await pc.createOffer();
-                  await pc.setLocalDescription(offer);
-                  ws.send(JSON.stringify({
-                    type: "offer",
-                    offer: pc.localDescription,
-                    meetingId
-                  }));
-                } catch (err) {
-                  console.error("Error creating offer for new peer:", err);
-                } finally {
-                  makingOfferRef.current = false;
-                }
-              }
-
-            } else if (data.type === "joined") {
-              // We just joined, check if there are existing peers
-              if (data.existingPeers && data.existingPeers.length > 0) {
-                // We are the polite peer (new joiner)
-                isPoliteRef.current = true;
-                setParticipants(data.existingPeers.length + 1);
-              }
-
-            } else if (data.type === "peer-left") {
-              setHasRemote(false);
-              setParticipants(1);
-              if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = null;
-              }
+            } catch (err) {
+              console.error("Error handling answer:", err);
             }
-          } catch (err) {
-            console.error("Message error:", err);
+          }
+
+          else if (data.type === "ice-candidate" && data.candidate) {
+            if (!pc) return;
+            try {
+              if (pc.remoteDescription) {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+              }
+            } catch (err) {
+              // Ignore ICE errors
+            }
+          }
+
+          else if (data.type === "peer-left") {
+            console.log("Peer left");
+            setHasRemote(false);
+            setParticipants(1);
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.srcObject = null;
+            }
+            // Reset for next peer
+            createPeerConnection();
           }
         };
 
-        ws.onclose = () => setConnected(false);
-        ws.onerror = () => setError("Connection failed");
+        ws.onclose = () => {
+          console.log("WebSocket closed");
+          setConnected(false);
+        };
+
+        ws.onerror = (e) => {
+          console.error("WebSocket error:", e);
+          setError("Connection failed");
+        };
 
       } catch (err) {
+        console.error("Init error:", err);
         setError("Camera/Mic access denied. Please allow permissions.");
       }
     };
@@ -266,15 +333,15 @@ export default function ConferencePage() {
           <h1 style={{ fontSize: "24px", fontWeight: "bold", color: "#fff" }}>Video Conference</h1>
           <span style={{
             padding: "4px 12px",
-            borderRadius: "20px",
+            borderRadius: "999px",
             fontSize: "12px",
             background: connected ? "rgba(34, 197, 94, 0.2)" : "rgba(239, 68, 68, 0.2)",
-            color: connected ? "#22c55e" : "#ef4444"
+            color: connected ? "#22c55e" : "#ef4444",
           }}>
-            ● {connected ? "Connected" : "Connecting..."}
+            {connected ? "● Connected" : "● Disconnected"}
           </span>
           <span style={{ color: "#888" }}>{formatTime(duration)}</span>
-          <span style={{ color: "#888" }}>{participants}</span>
+          <span style={{ color: "#888" }}>👥 {participants}</span>
         </div>
         <button onClick={endCall} style={{ padding: "8px 16px", background: "#ef4444", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
           End Call
@@ -304,36 +371,44 @@ export default function ConferencePage() {
           <video ref={localVideoRef} autoPlay muted playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e", transform: "scaleX(-1)" }} />
         </div>
 
-        <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
-          <span style={{ color: "#fff", marginBottom: "12px", display: "block" }}>{hasRemote ? "Remote" : "Waiting..."}</span>
-          {hasRemote ? (
+        {hasRemote ? (
+          <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
+            <span style={{ color: "#fff", marginBottom: "12px", display: "block" }}>Remote</span>
             <video ref={remoteVideoRef} autoPlay playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e" }} />
-          ) : (
+          </div>
+        ) : (
+          <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
+            <span style={{ color: "#fff", marginBottom: "12px", display: "block" }}>Waiting for peer...</span>
             <div style={{ aspectRatio: "16/9", background: "#1a1a2e", borderRadius: "8px", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "16px" }}>
               <div style={{ width: "48px", height: "48px", border: "3px solid #333", borderTopColor: "#a855f7", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
-              <span style={{ color: "#666" }}>Waiting for others</span>
+              <span style={{ color: "#666" }}>Waiting for others to join</span>
               <span style={{ color: "#a855f7", fontFamily: "monospace" }}>{meetingId}</span>
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <div style={{ display: "flex", justifyContent: "center", gap: "12px" }}>
         <button onClick={toggleAudio} style={{ padding: "12px 24px", background: isAudioMuted ? "#ef4444" : "#333", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
-          {isAudioMuted ? "Unmute" : "Mute"}
+          {isAudioMuted ? "🔇 Unmute" : "🎤 Mute"}
         </button>
         <button onClick={toggleVideo} style={{ padding: "12px 24px", background: isVideoOff ? "#ef4444" : "#333", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
-          {isVideoOff ? "Start Video" : "Stop Video"}
+          {isVideoOff ? "📷 Start Video" : "🎥 Stop Video"}
         </button>
         <button onClick={copyMeetingId} style={{ padding: "12px 24px", background: "#a855f7", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
-          Invite
+          📋 Share Meeting ID
         </button>
         <button onClick={endCall} style={{ padding: "12px 24px", background: "#ef4444", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
-          End Call
+          📞 End Call
         </button>
       </div>
 
-      <style jsx>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      <style jsx global>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   );
 }
