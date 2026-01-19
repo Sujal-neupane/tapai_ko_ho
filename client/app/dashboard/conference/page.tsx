@@ -390,7 +390,13 @@ export default function ConferencePage() {
         {hasRemote ? (
           <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
             <span style={{ color: "#fff", marginBottom: "12px", display: "block" }}>Remote</span>
-            <video ref={remoteVideoRef} autoPlay playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e" }} />
+            <video
+              ref={remoteVideoRef}
+              autoPlay
+              playsInline
+              controls
+              style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e" }}
+            />
           </div>
         ) : (
           <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
