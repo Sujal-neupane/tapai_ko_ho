@@ -27,6 +27,7 @@ export default function ConferencePage() {
   const [duration, setDuration] = useState(0);
   const [copied, setCopied] = useState(false);
   const [participants, setParticipants] = useState(1);
+  const [isHost, setIsHost] = useState(true);
 
   useEffect(() => {
     const timer = setInterval(() => setDuration(d => d + 1), 1000);
@@ -192,11 +193,13 @@ export default function ConferencePage() {
             if (existingPeers.length > 0) {
               // We are the polite peer (new joiner)
               isPoliteRef.current = true;
+              setIsHost(false);
               setParticipants(existingPeers.length + 1);
               console.log("We are POLITE (new joiner)");
             } else {
               // We are the impolite peer (first in room)
               isPoliteRef.current = false;
+              setIsHost(true);
               console.log("We are IMPOLITE (first in room)");
             }
           }
@@ -206,11 +209,24 @@ export default function ConferencePage() {
             console.log("New peer joined, we send offer");
             setParticipants(p => p + 1);
             
-            // Recreate peer connection to reset state
-            createPeerConnection();
-            
-            // Small delay then send offer
-            setTimeout(() => sendOffer(), 100);
+            // Send offer with current peer connection
+            const currentPc = pcRef.current;
+            const currentWs = wsRef.current;
+            if (currentPc && currentWs && currentWs.readyState === WebSocket.OPEN) {
+              try {
+                console.log("Creating offer for new peer...");
+                const offer = await currentPc.createOffer();
+                await currentPc.setLocalDescription(offer);
+                currentWs.send(JSON.stringify({
+                  type: "offer",
+                  offer: currentPc.localDescription,
+                  meetingId
+                }));
+                console.log("Offer sent to new peer");
+              } catch (err) {
+                console.error("Error sending offer:", err);
+              }
+            }
           }
 
           else if (data.type === "offer") {
@@ -366,7 +382,7 @@ export default function ConferencePage() {
         <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "12px" }}>
             <span style={{ color: "#fff" }}>You</span>
-            <span style={{ padding: "2px 8px", background: "#a855f7", color: "#fff", borderRadius: "4px", fontSize: "12px" }}>HOST</span>
+            <span style={{ padding: "2px 8px", background: isHost ? "#a855f7" : "#22c55e", color: "#fff", borderRadius: "4px", fontSize: "12px" }}>{isHost ? "HOST" : "GUEST"}</span>
           </div>
           <video ref={localVideoRef} autoPlay muted playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e", transform: "scaleX(-1)" }} />
         </div>
