@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+// Backend IP - Change this to host's IP
+const BACKEND_IP = '172.20.10.13';
+
 export default function ConferencePage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -10,10 +13,11 @@ export default function ConferencePage() {
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const pendingCandidatesRef = useRef<RTCIceCandidate[]>([]);
-  const hasRemoteDescRef = useRef(false);
+  const makingOfferRef = useRef(false);
+  const ignoreOfferRef = useRef(false);
+  const isPoliteRef = useRef(false);
 
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [connected, setConnected] = useState(false);
@@ -42,127 +46,150 @@ export default function ConferencePage() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const processPendingCandidates = async (pc: RTCPeerConnection) => {
-    for (const candidate of pendingCandidatesRef.current) {
-      try {
-        await pc.addIceCandidate(candidate);
-      } catch (e) {
-        console.warn("Failed to add queued ICE candidate:", e);
-      }
+  // Create peer connection
+  const createPeerConnection = (stream: MediaStream, ws: WebSocket) => {
+    if (pcRef.current) {
+      pcRef.current.close();
     }
-    pendingCandidatesRef.current = [];
+
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ]
+    });
+    pcRef.current = pc;
+
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+    pc.ontrack = (e) => {
+      if (remoteVideoRef.current && e.streams[0]) {
+        remoteVideoRef.current.srcObject = e.streams[0];
+        setHasRemote(true);
+        setParticipants(2);
+      }
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "ice-candidate",
+          candidate: e.candidate,
+          meetingId
+        }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        setHasRemote(false);
+        setParticipants(1);
+      }
+    };
+
+    pc.onnegotiationneeded = async () => {
+      try {
+        makingOfferRef.current = true;
+        await pc.setLocalDescription();
+        ws.send(JSON.stringify({
+          type: "offer",
+          offer: pc.localDescription,
+          meetingId
+        }));
+      } catch (err) {
+        console.error("Negotiation error:", err);
+      } finally {
+        makingOfferRef.current = false;
+      }
+    };
+
+    return pc;
   };
 
   useEffect(() => {
     let stream: MediaStream | null = null;
+    let ws: WebSocket | null = null;
 
     const init = async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         setLocalStream(stream);
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
 
-        const pc = new RTCPeerConnection({ 
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:stun1.l.google.com:19302" }
-          ] 
-        });
-        peerConnectionRef.current = pc;
-        stream.getTracks().forEach(t => pc.addTrack(t, stream!));
-
-        pc.ontrack = (e) => {
-          if (remoteVideoRef.current && e.streams[0]) {
-            remoteVideoRef.current.srcObject = e.streams[0];
-            setHasRemote(true);
-            setParticipants(2);
-          }
-        };
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: "ice-candidate", candidate: e.candidate, meetingId }));
-          }
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
-            setHasRemote(false);
-            setParticipants(1);
-          }
-        };
-
-        // Backend WebSocket - HARDCODED IP for hackathon
-        // Change '172.20.10.13' to host's IP if network changes
-        const BACKEND_IP = '172.20.10.13';
-        const wsUrl = `ws://${BACKEND_IP}:8000/conference`;
-        const ws = new WebSocket(wsUrl);
+        ws = new WebSocket(`ws://${BACKEND_IP}:8000/conference`);
         wsRef.current = ws;
 
         ws.onopen = () => {
           setConnected(true);
-          ws.send(JSON.stringify({ type: "join", meetingId }));
+          createPeerConnection(stream!, ws!);
+          ws!.send(JSON.stringify({ type: "join", meetingId }));
         };
 
         ws.onmessage = async (evt) => {
           const data = JSON.parse(evt.data);
-          
-          if (data.type === "offer") {
-            // Only process offer if we're in stable state
-            if (pc.signalingState === "stable") {
+          const pc = pcRef.current;
+          if (!pc) return;
+
+          try {
+            if (data.type === "offer") {
+              const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
+              ignoreOfferRef.current = !isPoliteRef.current && offerCollision;
+              
+              if (ignoreOfferRef.current) return;
+
               await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-              hasRemoteDescRef.current = true;
-              await processPendingCandidates(pc);
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              ws.send(JSON.stringify({ type: "answer", answer, meetingId }));
-            }
-          } else if (data.type === "answer") {
-            // Only set answer if we're expecting one (have-local-offer state)
-            if (pc.signalingState === "have-local-offer") {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-              hasRemoteDescRef.current = true;
-              await processPendingCandidates(pc);
-            }
-          } else if (data.type === "ice-candidate") {
-            const candidate = new RTCIceCandidate(data.candidate);
-            if (hasRemoteDescRef.current && pc.remoteDescription) {
-              try {
-                await pc.addIceCandidate(candidate);
-              } catch (e) {
-                console.warn("Failed to add ICE candidate:", e);
+              await pc.setLocalDescription();
+              ws!.send(JSON.stringify({
+                type: "answer",
+                answer: pc.localDescription,
+                meetingId
+              }));
+
+            } else if (data.type === "answer") {
+              if (pc.signalingState === "have-local-offer") {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
               }
-            } else {
-              pendingCandidatesRef.current.push(candidate);
+
+            } else if (data.type === "ice-candidate" && data.candidate) {
+              try {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+              } catch (e) {
+                if (!ignoreOfferRef.current) {
+                  console.warn("ICE error (can ignore):", e);
+                }
+              }
+
+            } else if (data.type === "peer-joined") {
+              isPoliteRef.current = true;
+              setParticipants(p => p + 1);
+
+            } else if (data.type === "peer-left") {
+              setHasRemote(false);
+              setParticipants(1);
+              if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = null;
+              }
             }
-          } else if (data.type === "peer-joined") {
-            // Only create offer if we're in stable state
-            if (pc.signalingState === "stable") {
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              ws.send(JSON.stringify({ type: "offer", offer, meetingId }));
-            }
-          } else if (data.type === "peer-left") {
-            setHasRemote(false);
-            setParticipants(1);
-            // Reset peer connection state
-            hasRemoteDescRef.current = false;
-            pendingCandidatesRef.current = [];
+          } catch (err) {
+            console.error("Message error:", err);
           }
         };
 
         ws.onclose = () => setConnected(false);
         ws.onerror = () => setError("Connection failed");
+
       } catch (err) {
         setError("Camera/Mic access denied. Please allow permissions.");
       }
     };
 
     init();
-    
+
     return () => {
       stream?.getTracks().forEach(t => t.stop());
-      peerConnectionRef.current?.close();
+      pcRef.current?.close();
       wsRef.current?.close();
     };
   }, [meetingId]);
@@ -177,141 +204,88 @@ export default function ConferencePage() {
     setIsVideoOff(!isVideoOff);
   };
 
+  const endCall = () => {
+    localStream?.getTracks().forEach(t => t.stop());
+    pcRef.current?.close();
+    wsRef.current?.close();
+    router.push("/dashboard");
+  };
+
   return (
-    <div style={{ height: "calc(100vh - 48px)", display: "flex", flexDirection: "column" }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
-          <h1 className="gradient-text" style={{ fontSize: "20px", fontWeight: "600" }}>Video Conference</h1>
-          <div className={connected ? "badge badge-success" : "badge badge-danger"}>
-            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: connected ? "#34d399" : "#f87171" }}></span>
-            {connected ? "Live" : "Connecting..."}
-          </div>
-          <span style={{ color: "#a78bfa", fontSize: "14px", fontWeight: "600" }}>{formatTime(duration)}</span>
-          <span style={{ color: "#64748b", fontSize: "13px" }}> {participants}</span>
+    <div style={{ padding: "24px", minHeight: "100vh", background: "#0a0a0f" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "24px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <h1 style={{ fontSize: "24px", fontWeight: "bold", color: "#fff" }}>Video Conference</h1>
+          <span style={{
+            padding: "4px 12px",
+            borderRadius: "20px",
+            fontSize: "12px",
+            background: connected ? "rgba(34, 197, 94, 0.2)" : "rgba(239, 68, 68, 0.2)",
+            color: connected ? "#22c55e" : "#ef4444"
+          }}>
+            ● {connected ? "Connected" : "Connecting..."}
+          </span>
+          <span style={{ color: "#888" }}>{formatTime(duration)}</span>
+          <span style={{ color: "#888" }}>{participants}</span>
         </div>
-        <button onClick={() => router.push("/dashboard")} className="btn" style={{ background: "rgba(239,68,68,0.2)", color: "#f87171", border: "1px solid rgba(239,68,68,0.3)", padding: "8px 16px", fontSize: "13px" }}>
+        <button onClick={endCall} style={{ padding: "8px 16px", background: "#ef4444", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
           End Call
         </button>
       </div>
 
-      {/* Meeting ID Share Bar */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "12px", padding: "12px", margin: "16px 0", background: "rgba(102,126,234,0.1)", borderRadius: "10px", border: "1px solid rgba(102,126,234,0.2)" }}>
-        <span style={{ color: "#94a3b8", fontSize: "13px" }}>Share this ID to invite others:</span>
-        <code style={{ background: "rgba(0,0,0,0.3)", padding: "6px 12px", borderRadius: "6px", fontSize: "15px", fontWeight: "600", color: "#a78bfa", letterSpacing: "1px" }}>{meetingId}</code>
-        <button onClick={copyMeetingId} className="btn" style={{ background: copied ? "rgba(16,185,129,0.2)" : "rgba(255,255,255,0.1)", color: copied ? "#34d399" : "#e2e8f0", border: "none", padding: "6px 12px", fontSize: "12px" }}>
-          {copied ? " Copied!" : " Copy"}
+      <div style={{ padding: "16px", marginBottom: "16px", background: "rgba(255,255,255,0.05)", borderRadius: "12px", display: "flex", justifyContent: "flex-end", alignItems: "center", gap: "12px" }}>
+        <span style={{ color: "#888" }}>Share this ID:</span>
+        <span style={{ color: "#a855f7", fontWeight: "bold", fontFamily: "monospace" }}>{meetingId}</span>
+        <button onClick={copyMeetingId} style={{ padding: "6px 12px", background: "#333", color: "#fff", border: "none", borderRadius: "6px", cursor: "pointer" }}>
+          {copied ? "Copied!" : "Copy"}
         </button>
       </div>
 
       {error && (
-        <div style={{ padding: "12px 16px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: "8px", marginBottom: "16px", color: "#f87171", fontSize: "14px" }}>
+        <div style={{ padding: "12px", marginBottom: "16px", background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.3)", borderRadius: "8px", color: "#ef4444" }}>
           {error}
         </div>
       )}
 
-      {/* Video Grid */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", minHeight: 0 }}>
-        {/* Local Video */}
-        <div className="card" style={{ display: "flex", flexDirection: "column", padding: "16px", overflow: "hidden" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span style={{ fontSize: "14px", fontWeight: "500" }}>You</span>
-              <span style={{ fontSize: "10px", padding: "2px 6px", background: "rgba(102,126,234,0.2)", borderRadius: "4px", color: "#a78bfa" }}>HOST</span>
-            </div>
-            <div style={{ display: "flex", gap: "6px" }}>
-              <button onClick={toggleAudio} style={{ 
-                width: "32px", height: "32px", borderRadius: "6px", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "14px",
-                background: isAudioMuted ? "rgba(239,68,68,0.3)" : "rgba(255,255,255,0.1)", color: isAudioMuted ? "#f87171" : "#e2e8f0"
-              }}>
-                {isAudioMuted ? "" : ""}
-              </button>
-              <button onClick={toggleVideo} style={{ 
-                width: "32px", height: "32px", borderRadius: "6px", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "14px",
-                background: isVideoOff ? "rgba(239,68,68,0.3)" : "rgba(255,255,255,0.1)", color: isVideoOff ? "#f87171" : "#e2e8f0"
-              }}>
-                {isVideoOff ? "" : ""}
-              </button>
-            </div>
+      <div style={{ display: "grid", gridTemplateColumns: hasRemote ? "1fr 1fr" : "1fr", gap: "16px", marginBottom: "24px" }}>
+        <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "12px" }}>
+            <span style={{ color: "#fff" }}>You</span>
+            <span style={{ padding: "2px 8px", background: "#a855f7", color: "#fff", borderRadius: "4px", fontSize: "12px" }}>HOST</span>
           </div>
-          <div style={{ flex: 1, borderRadius: "12px", overflow: "hidden", background: "#0a0a0f", position: "relative", minHeight: "200px" }}>
-            <video ref={localVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-            {isVideoOff && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "linear-gradient(135deg, #1a1a2e, #0f0f1a)" }}>
-                <div style={{ textAlign: "center" }}>
-                  <div style={{ width: "80px", height: "80px", borderRadius: "50%", background: "linear-gradient(135deg, rgba(102,126,234,0.3), rgba(168,85,247,0.3))", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px", fontSize: "32px" }}>
-                    
-                  </div>
-                  <span style={{ color: "#64748b", fontSize: "13px" }}>Camera off</span>
-                </div>
-              </div>
-            )}
-          </div>
+          <video ref={localVideoRef} autoPlay muted playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e", transform: "scaleX(-1)" }} />
         </div>
 
-        {/* Remote Video / Waiting */}
-        <div className="card" style={{ display: "flex", flexDirection: "column", padding: "16px", overflow: "hidden" }}>
-          <div style={{ marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
-            <span style={{ fontSize: "14px", fontWeight: "500" }}>{hasRemote ? "Participant" : "Waiting..."}</span>
-            {hasRemote && <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#34d399" }}></span>}
-          </div>
-          <div style={{ flex: 1, borderRadius: "12px", overflow: "hidden", background: "#0a0a0f", position: "relative", minHeight: "200px" }}>
-            <video ref={remoteVideoRef} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: hasRemote ? "block" : "none" }} />
-            {!hasRemote && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "linear-gradient(135deg, rgba(102,126,234,0.05), rgba(168,85,247,0.05))" }}>
-                <div style={{ textAlign: "center", maxWidth: "280px" }}>
-                  <div style={{ width: "80px", height: "80px", borderRadius: "50%", background: "rgba(255,255,255,0.03)", border: "2px dashed rgba(255,255,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
-                    <span style={{ fontSize: "32px", opacity: 0.5 }}></span>
-                  </div>
-                  <p style={{ color: "#94a3b8", fontSize: "15px", fontWeight: "500", marginBottom: "8px" }}>Waiting for others to join</p>
-                  <p style={{ color: "#64748b", fontSize: "13px", lineHeight: 1.5 }}>Share the meeting ID above to invite participants</p>
-                  <div style={{ marginTop: "16px", padding: "10px 16px", background: "rgba(0,0,0,0.3)", borderRadius: "8px", display: "inline-block" }}>
-                    <span style={{ color: "#a78bfa", fontWeight: "600", letterSpacing: "1px" }}>{meetingId}</span>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
+        <div style={{ background: "rgba(255,255,255,0.05)", borderRadius: "12px", padding: "16px" }}>
+          <span style={{ color: "#fff", marginBottom: "12px", display: "block" }}>{hasRemote ? "Remote" : "Waiting..."}</span>
+          {hasRemote ? (
+            <video ref={remoteVideoRef} autoPlay playsInline style={{ width: "100%", borderRadius: "8px", background: "#1a1a2e" }} />
+          ) : (
+            <div style={{ aspectRatio: "16/9", background: "#1a1a2e", borderRadius: "8px", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: "16px" }}>
+              <div style={{ width: "48px", height: "48px", border: "3px solid #333", borderTopColor: "#a855f7", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+              <span style={{ color: "#666" }}>Waiting for others</span>
+              <span style={{ color: "#a855f7", fontFamily: "monospace" }}>{meetingId}</span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Bottom Controls */}
-      <div style={{ display: "flex", justifyContent: "center", gap: "12px", padding: "20px 0", borderTop: "1px solid rgba(255,255,255,0.05)", marginTop: "16px" }}>
-        <button onClick={toggleAudio} className="btn" style={{ 
-          background: isAudioMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.05)", 
-          color: isAudioMuted ? "#f87171" : "#e2e8f0",
-          border: isAudioMuted ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.1)",
-          padding: "12px 24px", borderRadius: "12px"
-        }}>
-          {isAudioMuted ? " Unmute" : " Mute"}
+      <div style={{ display: "flex", justifyContent: "center", gap: "12px" }}>
+        <button onClick={toggleAudio} style={{ padding: "12px 24px", background: isAudioMuted ? "#ef4444" : "#333", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
+          {isAudioMuted ? "Unmute" : "Mute"}
         </button>
-        <button onClick={toggleVideo} className="btn" style={{ 
-          background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.05)", 
-          color: isVideoOff ? "#f87171" : "#e2e8f0",
-          border: isVideoOff ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.1)",
-          padding: "12px 24px", borderRadius: "12px"
-        }}>
-          {isVideoOff ? " Start Video" : " Stop Video"}
+        <button onClick={toggleVideo} style={{ padding: "12px 24px", background: isVideoOff ? "#ef4444" : "#333", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
+          {isVideoOff ? "Start Video" : "Stop Video"}
         </button>
-        <button onClick={copyMeetingId} className="btn" style={{ 
-          background: "rgba(102,126,234,0.2)", 
-          color: "#a78bfa",
-          border: "1px solid rgba(102,126,234,0.3)",
-          padding: "12px 24px", borderRadius: "12px"
-        }}>
-           Invite
+        <button onClick={copyMeetingId} style={{ padding: "12px 24px", background: "#a855f7", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
+          Invite
         </button>
-        <button onClick={() => router.push("/dashboard")} className="btn" style={{ 
-          background: "linear-gradient(135deg, #ef4444, #dc2626)", 
-          color: "white", 
-          border: "none", 
-          padding: "12px 24px", 
-          borderRadius: "12px",
-          boxShadow: "0 4px 15px rgba(239,68,68,0.3)"
-        }}>
-           End Call
+        <button onClick={endCall} style={{ padding: "12px 24px", background: "#ef4444", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" }}>
+          End Call
         </button>
       </div>
+
+      <style jsx>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
