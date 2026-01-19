@@ -173,7 +173,7 @@ export default function ConferencePage() {
               }
 
             } else if (data.type === "ice-candidate" && data.candidate) {
-              if (pc.signalingState !== "closed") {
+              if ((pc.signalingState as string) !== "closed") {
                 try {
                   await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
                 } catch (e) {
@@ -182,8 +182,36 @@ export default function ConferencePage() {
               }
 
             } else if (data.type === "peer-joined") {
-              isPoliteRef.current = true;
+              // We are the existing peer (impolite), new peer joined
+              // We need to send an offer to the new peer
               setParticipants(p => p + 1);
+              
+              // Create and send offer to the new peer
+              const pc = pcRef.current;
+              if (pc && ws) {
+                try {
+                  makingOfferRef.current = true;
+                  const offer = await pc.createOffer();
+                  await pc.setLocalDescription(offer);
+                  ws.send(JSON.stringify({
+                    type: "offer",
+                    offer: pc.localDescription,
+                    meetingId
+                  }));
+                } catch (err) {
+                  console.error("Error creating offer for new peer:", err);
+                } finally {
+                  makingOfferRef.current = false;
+                }
+              }
+
+            } else if (data.type === "joined") {
+              // We just joined, check if there are existing peers
+              if (data.existingPeers && data.existingPeers.length > 0) {
+                // We are the polite peer (new joiner)
+                isPoliteRef.current = true;
+                setParticipants(data.existingPeers.length + 1);
+              }
 
             } else if (data.type === "peer-left") {
               setHasRemote(false);
